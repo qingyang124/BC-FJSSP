@@ -6,7 +6,6 @@ import argparse
 import copy
 import random
 import json
-from datetime import datetime
 from actor import Model
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import to_hetero
@@ -14,7 +13,7 @@ from generate_instances.generator import generate_instance_list
 from generate_instances.parsedata import get_data, parse
 from generate_instances.solver import solve_fjsp
 from env import FJSSPEnv
-from evaluate_model import evaluate_model, evaluate_val
+from evaluate_model import evaluate_val
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 if torch.cuda.is_available():
@@ -25,13 +24,31 @@ def parse_arguments():
     parser.add_argument('--hidden_channels', type=int, default=128, help='Number of hidden channels')
     parser.add_argument('--num_layers', type=int, default=3, help='Number of layers')
     parser.add_argument('--learning_rate', type=float, default=0.0002, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay for Adam optimizer')
+    parser.add_argument('--lr_factor', type=float, default=0.5, help='Factor for ReduceLROnPlateau scheduler')
+    parser.add_argument('--lr_patience', type=int, default=2, help='Patience for ReduceLROnPlateau scheduler')
+    parser.add_argument('--min_lr', type=float, default=1e-6, help='Minimum learning rate for scheduler')
     parser.add_argument('--heads', type=int, default=3, help='Number of attention heads')
     parser.add_argument('--episodes', type=int, default=25, help='Number of episodes')
     parser.add_argument('--num_cases', type=int, default=50, help='Number of cases')
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
     parser.add_argument('--epochs', type=int, default=4, help='Number of epochs')
     parser.add_argument('--number_group', type=int, default=3, help='Number of groups')
+    parser.add_argument('--val_interval', type=int, default=1, help='Validate every n episodes')
+    parser.add_argument('--clip_grad', type=float, default=1.0, help='Gradient clipping max norm')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     return parser.parse_args()
+
+
+def set_seed(seed: int) -> None:
+    """Set random seeds for full reproducibility."""
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def generate_train_instances(train_config):
     list_instances = generate_instance_list(**train_config)
@@ -47,7 +64,7 @@ def generate_train_instances(train_config):
         })
     return instances
 
-def train(model, optimizer, train_loader):
+def train(model, optimizer, train_loader, clip_grad=None):
     kl_loss = torch.nn.KLDivLoss(reduction="batchmean", log_target=False)
     model.train()
     total_examples, total_loss, total_acc = 0, 0, 0
@@ -69,11 +86,15 @@ def train(model, optimizer, train_loader):
         list_targets = torch.stack(apply_padding(list_targets))
         loss = kl_loss(list_action_prob, list_targets)
         loss.backward()
+
+        if clip_grad is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+
         optimizer.step()
-        len_bach_size = len(batch)
-        total_examples += len_bach_size
-        total_loss += float(loss) * len_bach_size
-        total_acc += float(acc) * len_bach_size
+        len_batch_size = batch.num_graphs if hasattr(batch, "num_graphs") else len(batch)
+        total_examples += len_batch_size
+        total_loss += float(loss) * len_batch_size
+        total_acc += float(acc) * len_batch_size
     return total_loss / total_examples, total_acc / total_examples
 
 def get_accuracy(list_action_prob, list_targets):
@@ -177,41 +198,70 @@ def generate_instances_train(n_cases, episode, number_group):
     return expert_observations
 
 def start_train(args):
+    set_seed(args.seed)
     os.makedirs("data/opt_results/", exist_ok=True)
     os.makedirs("./models/", exist_ok=True)
 
     expert_observations = generate_instances_train(50, -1, 2)
-    model = Model(hidden_channels=args.hidden_channels, metadata=expert_observations[0].metadata(), num_layers=args.num_layers, heads=args.heads)
+    model = Model(
+        hidden_channels=args.hidden_channels,
+        metadata=expert_observations[0].metadata(),
+        num_layers=args.num_layers,
+        heads=args.heads,
+    )
     model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=args.lr_factor,
+        patience=args.lr_patience,
+        min_lr=args.min_lr,
+    )
 
     best_val_result = float('inf')
-    best_model = None
+    best_model_state = None
 
     for episode in range(args.episodes):
         model = model.to(device)
-        expert_observations = generate_instances_train(args.num_cases, ((args.number_group-1)*episode)%(200-args.number_group-2)+1, args.number_group)
-        train_loader = DataLoader(expert_observations, batch_size=args.batch_size)
+        expert_observations = generate_instances_train(
+            args.num_cases,
+            ((args.number_group - 1) * episode) % (200 - args.number_group - 2) + 1,
+            args.number_group,
+        )
+        train_loader = DataLoader(
+            expert_observations, batch_size=args.batch_size, shuffle=True
+        )
 
         for epoch in range(1, args.epochs + 1):
-            loss, acc = train(model, optimizer, train_loader)
-            print(f"Episode: {episode}, Epoch: {epoch}, Loss: {loss:.4f}, Acc: {acc:.4f}")
+            loss, acc = train(
+                model, optimizer, train_loader, clip_grad=args.clip_grad
+            )
+            print(
+                f"Episode: {episode}, Epoch: {epoch}, Loss: {loss:.4f}, Acc: {acc:.4f}, LR: {optimizer.param_groups[0]['lr']:.6f}"
+            )
 
-        if episode > 20:
+        should_validate = (episode % args.val_interval == 0) or (episode == args.episodes - 1)
+        if should_validate:
             val_res = evaluate_val(model, "data/opt_results/opt_results_0.json")
-            print(f"Episode: {episode}, Val: {val_res[0]}")
+            scheduler.step(val_res[0])
+            print(f"Episode: {episode}, Val: {val_res[0]:.4f}")
 
             if val_res[0] < best_val_result:
                 best_val_result = val_res[0]
-                best_model = copy.deepcopy(model)
+                best_model_state = copy.deepcopy(model.state_dict())
 
 
     # Save the best model
-    if best_model is not None:
-        best_model_path = f"./models/model.pt"
-        torch.save(best_model.state_dict(), best_model_path)
-        print(f"Best model saved with validation result: {best_val_result:.4f}")
-    
+    if best_model_state is None:
+        best_model_state = model.state_dict()
+
+    best_model_path = f"./models/model.pt"
+    torch.save(best_model_state, best_model_path)
+    print(f"Best model saved with validation result: {best_val_result:.4f}")
+
     return best_val_result
 
 if __name__ == "__main__":
